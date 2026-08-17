@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from download.s3_browser import _make_s3_client
+from utils.session_guard import ensure_sso_valid, is_auth_error
 
 
 def list_all_objects(
@@ -63,8 +64,6 @@ def download_prefix(
     Returns:
         Tuple of (downloaded_count, skipped_count).
     """
-    s3 = _make_s3_client(profile)
-
     if prefix and not prefix.endswith("/"):
         prefix = prefix + "/"
 
@@ -101,7 +100,29 @@ def download_prefix(
         if emit:
             emit(f"  [DOWNLOAD] {key}")
 
-        s3.download_file(bucket, key, str(local_path))
+        # Proactively refresh the SSO session if it's near/at real expiry
+        # before starting the next file (cheap: reads a local cache file).
+        if not ensure_sso_valid(profile, emit=emit):
+            raise RuntimeError("AWS SSO session refresh failed mid-download.")
+        s3 = _make_s3_client(profile)
+
+        try:
+            s3.download_file(bucket, key, str(local_path))
+        except Exception as exc:
+            if not is_auth_error(exc):
+                raise
+            # Token expired mid-transfer (e.g. a very large file). The
+            # partially-written file is incomplete/corrupt — remove it so a
+            # retry (here, or a future skip_existing run) doesn't mistake it
+            # for a completed download.
+            if emit:
+                emit(f"  Auth error mid-download ({exc}) — refreshing session and retrying...")
+            local_path.unlink(missing_ok=True)
+            if not ensure_sso_valid(profile, buffer_seconds=10**9, emit=emit):
+                raise
+            s3 = _make_s3_client(profile)
+            s3.download_file(bucket, key, str(local_path))
+
         downloaded += 1
 
     return downloaded, skipped

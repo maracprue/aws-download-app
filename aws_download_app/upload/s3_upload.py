@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from download.s3_browser import _make_s3_client
+from utils.session_guard import ensure_sso_valid, is_auth_error
 
 
 def collect_local_files(source: Path) -> list[tuple[Path, str]]:
@@ -104,7 +105,6 @@ def upload_files(
         if emit:
             emit(msg)
 
-    s3 = _make_s3_client(profile)
     prefix = dest_prefix.strip("/")
 
     # Build full S3 keys
@@ -132,8 +132,26 @@ def upload_files(
             skipped += 1
             continue
 
+        # Proactively refresh the SSO session if it's near/at real expiry
+        # before starting the next file (cheap: reads a local cache file).
+        if not ensure_sso_valid(profile, emit=emit):
+            _log(f"[{i}/{total}] Could not refresh AWS session — stopping upload.")
+            raise RuntimeError("AWS SSO session refresh failed mid-upload.")
+        s3 = _make_s3_client(profile)
+
         _log(f"[{i}/{total}] Uploading  {local_path.name}  →  s3://{bucket}/{s3_key}")
-        s3.upload_file(str(local_path), bucket, s3_key)
+        try:
+            s3.upload_file(str(local_path), bucket, s3_key)
+        except Exception as exc:
+            if not is_auth_error(exc):
+                raise
+            # Token expired mid-transfer (e.g. a very large file) — force a
+            # fresh login, rebuild the client, and retry this file once.
+            _log(f"[{i}/{total}] Auth error mid-upload ({exc}) — refreshing session and retrying...")
+            if not ensure_sso_valid(profile, buffer_seconds=10**9, emit=emit):
+                raise
+            s3 = _make_s3_client(profile)
+            s3.upload_file(str(local_path), bucket, s3_key)
         uploaded += 1
 
     _log(f"\nDone — {uploaded} uploaded, {skipped} skipped.")
