@@ -13,6 +13,7 @@ the CLI actually performs a fresh login.
 from __future__ import annotations
 
 import configparser
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,38 +72,69 @@ def _get_sso_start_url(profile: Optional[str]) -> Optional[str]:
     return None
 
 
+def _get_sso_cache_key(profile: Optional[str]) -> Optional[str]:
+    """
+    Return the exact string AWS CLI/botocore hashes to name the cache file
+    for *profile* — the sso_session name if the profile uses the modern
+    [sso-session ...] block, otherwise the legacy sso_start_url.
+
+    Using this (rather than scanning every cache file and guessing which
+    one applies) is what guarantees we read the expiry of the token this
+    profile actually uses, instead of an unrelated cache entry for a
+    different profile/session that happens to have a later expiry.
+    """
+    if not _AWS_CONFIG_PATH.exists():
+        return None
+
+    cfg = configparser.ConfigParser()
+    cfg.read(str(_AWS_CONFIG_PATH))
+
+    section = f"profile {profile}" if profile else "default"
+    if not cfg.has_section(section) and section != "default":
+        return None
+
+    if cfg.has_option(section, "sso_session"):
+        return cfg.get(section, "sso_session")
+
+    if cfg.has_option(section, "sso_start_url"):
+        return cfg.get(section, "sso_start_url")
+
+    return None
+
+
+def _sso_cache_file_for(profile: Optional[str]) -> Optional[Path]:
+    """Return the exact cache file path AWS CLI uses for *profile*, if any."""
+    cache_key = _get_sso_cache_key(profile)
+    if not cache_key:
+        return None
+    filename = hashlib.sha1(cache_key.encode("utf-8")).hexdigest() + ".json"
+    path = _SSO_CACHE_DIR / filename
+    return path if path.exists() else None
+
+
 def get_sso_expiry(profile: Optional[str] = None) -> Optional[datetime]:
     """
     Return the expiry timestamp (UTC) of the cached SSO token for *profile*,
     or None if it can't be determined (missing cache, unparsable, etc.).
 
-    If multiple cache entries match (e.g. stale files from previous logins),
-    the latest ``expiresAt`` is returned.
+    Reads the exact cache file AWS CLI uses for this profile (see
+    _sso_cache_file_for) rather than scanning all cache files, since
+    unrelated cache entries (other profiles/sessions) can have very
+    different — and misleadingly later — expiry times.
     """
-    if not _SSO_CACHE_DIR.exists():
+    cache_file = _sso_cache_file_for(profile)
+    if cache_file is None:
         return None
 
-    start_url = _get_sso_start_url(profile)
+    try:
+        data = json.loads(cache_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
-    latest: Optional[datetime] = None
-    for cache_file in _SSO_CACHE_DIR.glob("*.json"):
-        try:
-            data = json.loads(cache_file.read_text(encoding="utf-8"))
-        except Exception:
-            continue
+    if "expiresAt" not in data:
+        return None
 
-        if "expiresAt" not in data:
-            continue
-
-        # If we know the expected start URL, only consider matching entries.
-        if start_url and data.get("startUrl") and data.get("startUrl") != start_url:
-            continue
-
-        expiry = _parse_expires_at(str(data["expiresAt"]))
-        if expiry and (latest is None or expiry > latest):
-            latest = expiry
-
-    return latest
+    return _parse_expires_at(str(data["expiresAt"]))
 
 
 def seconds_until_sso_expiry(profile: Optional[str] = None) -> Optional[float]:
@@ -166,11 +198,25 @@ _AUTH_ERROR_CODES = {
 def is_auth_error(exc: BaseException) -> bool:
     """True if *exc* looks like an expired/invalid-credentials error."""
     try:
-        from botocore.exceptions import ClientError
+        from botocore.exceptions import (
+            ClientError,
+            NoAuthTokenError,
+            SSOTokenLoadError,
+            TokenRetrievalError,
+            UnauthorizedSSOTokenError,
+        )
     except Exception:
         return False
 
-    if not isinstance(exc, ClientError):
-        return False
-    code = exc.response.get("Error", {}).get("Code", "")
-    return code in _AUTH_ERROR_CODES
+    # SSO token failures (e.g. "Token has expired and refresh failed") raise
+    # botocore's own SSO/token error types, NOT ClientError — this is the
+    # error boto3 actually raises when the cached SSO token is expired and
+    # can't be silently refreshed, so it must be treated as an auth error too.
+    if isinstance(exc, (TokenRetrievalError, SSOTokenLoadError, UnauthorizedSSOTokenError, NoAuthTokenError)):
+        return True
+
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        return code in _AUTH_ERROR_CODES
+
+    return False
