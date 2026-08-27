@@ -6,3 +6,4 @@ __pycache__/
 venv/
 *.log
 debug.log
+.upload_checkpoints/

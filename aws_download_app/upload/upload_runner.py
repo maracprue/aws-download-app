@@ -26,6 +26,10 @@ class UploadJob:
         self.thread: threading.Thread | None = None
         self.error: str | None = None
         self.result: Any = None  # (uploaded_count, skipped_count) on success
+        self.progress: dict[str, Any] = {
+            "done": 0, "total": 0, "uploaded": 0, "skipped": 0,
+            "current_file": "", "bytes_done": 0, "total_bytes": 0,
+        }
 
     def emit(self, msg: str) -> None:
         """Append a log line — safe to call from any thread."""
@@ -34,6 +38,10 @@ class UploadJob:
                 fh.write(msg + "\n")
         except Exception:
             pass
+
+    def set_progress(self, progress: dict[str, Any]) -> None:
+        """Update progress snapshot — safe to call from any thread."""
+        self.progress = progress
 
     def get_log(self) -> str:
         """Return the full log file content."""
@@ -75,7 +83,7 @@ def start_upload_job(fn: Callable, **kwargs) -> UploadJob:
 
     def _run() -> None:
         try:
-            result = fn(emit=job.emit, **kwargs)
+            result = fn(emit=job.emit, progress_cb=job.set_progress, **kwargs)
             job.result = result
             job.status = "done"
             job.emit("\n=== Upload complete ✓ ===")

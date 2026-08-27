@@ -28,10 +28,16 @@ from download.download_runner import (
     get_current_download_job,
     start_download_job,
 )
-from upload.s3_upload import check_existing_keys, collect_local_files, upload_files
+from upload.s3_upload import (
+    TooManyFilesError,
+    check_existing_keys,
+    collect_local_files,
+    upload_files,
+)
 from upload.upload_runner import clear_job, get_current_job, start_upload_job
 from utils.aws_auth import check_credentials, run_sso_login
 from utils.config import AWS_PROFILE, S3_BUCKET, S3_PREFIX
+from utils.upload_checkpoint import checkpoint_id_for
 
 # ──────────────────────────────────────────────
 # Page config
@@ -362,6 +368,30 @@ with tab_upload:
     # ──────────────────────────────────────────────────────────────────────
     if _job is not None and _job.is_running:
         st.info("⏳ **Upload in progress.** Do not close this tab — the upload will continue even if you click elsewhere in the app.")
+
+        prog = _job.progress or {}
+        total = prog.get("total") or 0
+        done = prog.get("done") or 0
+        total_bytes = prog.get("total_bytes") or 0
+        bytes_done = prog.get("bytes_done") or 0
+
+        if total:
+            fraction = min(done / total, 1.0)
+            size_bit = ""
+            if total_bytes:
+                size_bit = (
+                    f" — {bytes_done / 1e9:.2f}/{total_bytes / 1e9:.2f} GB"
+                    if total_bytes >= 1e9
+                    else f" — {bytes_done / 1e6:.1f}/{total_bytes / 1e6:.1f} MB"
+                )
+            st.progress(
+                fraction,
+                text=f"{done}/{total} files ({fraction * 100:.0f}%){size_bit}",
+            )
+            current_file = prog.get("current_file")
+            if current_file:
+                st.caption(f"Current: `{current_file}`")
+
         st.code(_job.get_log(), language=None)
         time.sleep(2)
         st.rerun()
@@ -442,8 +472,14 @@ with tab_upload:
                 st.error(f"Path does not exist: `{upload_source}`")
             else:
                 with st.spinner("Scanning local files and checking S3..."):
-                    items = collect_local_files(source_path)
-                    if not items:
+                    try:
+                        items = collect_local_files(source_path)
+                    except TooManyFilesError as e:
+                        st.error(f"🚫 {e}")
+                        items = None
+                    if items is None:
+                        pass
+                    elif not items:
                         st.warning("No files found at the specified path.")
                     else:
                         prefix_clean = upload_prefix.strip("/")
@@ -510,8 +546,9 @@ with tab_upload:
 
             if st.button("✅ Confirm & Start Upload", type="primary", key="confirm_upload"):
                 source_path = Path(upload_source)
+                cp_id = checkpoint_id_for(upload_bucket, upload_prefix, str(source_path))
 
-                def _do_upload(emit, **kw):
+                def _do_upload(emit, progress_cb, **kw):
                     return upload_files(
                         bucket=kw["bucket"],
                         items=kw["items"],
@@ -519,6 +556,8 @@ with tab_upload:
                         profile=kw["profile"],
                         overwrite=kw["overwrite"],
                         emit=emit,
+                        progress_cb=progress_cb,
+                        checkpoint_id=kw["checkpoint_id"],
                     )
 
                 start_upload_job(
@@ -528,6 +567,7 @@ with tab_upload:
                     dest_prefix=upload_prefix,
                     profile=aws_profile,
                     overwrite=overwrite,
+                    checkpoint_id=cp_id,
                 )
                 st.session_state.upload_conflict_result = None
                 st.rerun()
