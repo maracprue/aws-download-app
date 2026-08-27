@@ -8,13 +8,12 @@
 :: execution). Python fully reads and compiles a script before running it,
 :: so update_app.py is immune to that problem. This launcher itself should
 :: rarely if ever need to change.
+::
+:: Finding a real Python interpreter is delegated to update_app.ps1 (also
+:: immune to self-modification corruption) because a single guessed path
+:: with a bare "python" fallback isn't reliable across machines -- on some
+:: computers "python" resolves to the Windows Store's placeholder alias
+:: instead of a real interpreter.
 
-setlocal
-set "REPO_DIR=%~dp0"
-set "PYTHON=%USERPROFILE%\AppData\Local\miniconda3\python.exe"
-if not exist "%PYTHON%" set "PYTHON=python"
-
-"%PYTHON%" -u "%REPO_DIR%update_app.py"
-set "RC=%errorlevel%"
-pause
-exit /b %RC%
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0update_app.ps1"
+exit /b %errorlevel%
