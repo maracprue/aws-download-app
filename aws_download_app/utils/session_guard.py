@@ -149,13 +149,20 @@ def ensure_sso_valid(
     profile: Optional[str] = None,
     buffer_seconds: int = DEFAULT_BUFFER_SECONDS,
     emit: Optional[Callable[[str], None]] = None,
-) -> bool:
+) -> tuple[bool, bool]:
     """
     Check the real SSO token expiry and refresh via `aws sso login` only
     if needed (expired, near-expiry, or unknown).
 
-    Returns True if the session is valid after this call (either it already
-    was, or the refresh login succeeded); False if a needed refresh failed.
+    Returns (valid, refreshed):
+        valid:     True if the session is valid after this call (either it
+                   already was, or the refresh login succeeded).
+        refreshed: True only if a real `aws sso login` was actually run —
+                   callers should use this (not just "am I still valid?")
+                   to decide whether to rebuild their boto3 client, since
+                   rebuilding a client on every file is expensive (each one
+                   opens its own connection pool / transfer thread pool)
+                   and unnecessary when nothing actually changed.
     """
     from utils.aws_auth import run_sso_login  # local import avoids a cycle
 
@@ -166,7 +173,7 @@ def ensure_sso_valid(
     remaining = seconds_until_sso_expiry(profile)
 
     if remaining is not None and remaining > buffer_seconds:
-        return True  # still comfortably valid — no action needed
+        return True, False  # still comfortably valid — no action needed
 
     if remaining is None:
         _log("Could not determine SSO token expiry — refreshing to be safe...")
@@ -180,7 +187,7 @@ def ensure_sso_valid(
         _log("AWS SSO login refreshed successfully.")
     else:
         _log(f"AWS SSO login refresh FAILED: {output}")
-    return ok
+    return ok, True
 
 
 # Error codes that indicate the credentials/token are no longer valid,

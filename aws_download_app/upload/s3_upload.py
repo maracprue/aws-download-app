@@ -126,6 +126,13 @@ def upload_files(
     uploaded = 0
     skipped = 0
 
+    # Build the S3 client ONCE. Rebuilding it per file (as an earlier version
+    # did) creates a brand-new connection pool + transfer thread pool per
+    # file — with thousands of files that leaks memory/sockets/threads fast
+    # enough to destabilize the machine. We only rebuild when a real SSO
+    # login actually ran (see ensure_sso_valid's `refreshed` flag).
+    s3 = _make_s3_client(profile)
+
     for i, (local_path, s3_key) in enumerate(keyed, 1):
         if s3_key in existing:
             _log(f"[{i}/{total}] SKIP  {s3_key}")
@@ -134,10 +141,12 @@ def upload_files(
 
         # Proactively refresh the SSO session if it's near/at real expiry
         # before starting the next file (cheap: reads a local cache file).
-        if not ensure_sso_valid(profile, emit=emit):
+        valid, refreshed = ensure_sso_valid(profile, emit=emit)
+        if not valid:
             _log(f"[{i}/{total}] Could not refresh AWS session — stopping upload.")
             raise RuntimeError("AWS SSO session refresh failed mid-upload.")
-        s3 = _make_s3_client(profile)
+        if refreshed:
+            s3 = _make_s3_client(profile)
 
         _log(f"[{i}/{total}] Uploading  {local_path.name}  →  s3://{bucket}/{s3_key}")
         try:
@@ -148,7 +157,8 @@ def upload_files(
             # Token expired mid-transfer (e.g. a very large file) — force a
             # fresh login, rebuild the client, and retry this file once.
             _log(f"[{i}/{total}] Auth error mid-upload ({exc}) — refreshing session and retrying...")
-            if not ensure_sso_valid(profile, buffer_seconds=10**9, emit=emit):
+            valid, _ = ensure_sso_valid(profile, buffer_seconds=10**9, emit=emit)
+            if not valid:
                 raise
             s3 = _make_s3_client(profile)
             s3.upload_file(str(local_path), bucket, s3_key)

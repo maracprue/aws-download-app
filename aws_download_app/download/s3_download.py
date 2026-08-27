@@ -100,6 +100,11 @@ def download_prefix(
     downloaded = 0
     skipped = 0
 
+    # Build the S3 client ONCE (see the matching comment in upload_files —
+    # rebuilding per file leaks connection pools / transfer threads across
+    # thousands of files and can destabilize the machine).
+    s3 = _make_s3_client(profile)
+
     for i, (key, size) in enumerate(objects, 1):
         if max_file_size_bytes is not None and size > max_file_size_bytes:
             skipped += 1
@@ -135,9 +140,11 @@ def download_prefix(
 
         # Proactively refresh the SSO session if it's near/at real expiry
         # before starting the next file (cheap: reads a local cache file).
-        if not ensure_sso_valid(profile, buffer_seconds=buffer_seconds, emit=emit):
+        valid, refreshed = ensure_sso_valid(profile, buffer_seconds=buffer_seconds, emit=emit)
+        if not valid:
             raise RuntimeError("AWS SSO session refresh failed mid-download.")
-        s3 = _make_s3_client(profile)
+        if refreshed:
+            s3 = _make_s3_client(profile)
 
         try:
             s3.download_file(bucket, key, str(local_path))
@@ -151,7 +158,8 @@ def download_prefix(
             if emit:
                 emit(f"  Auth error mid-download ({exc}) — refreshing session and retrying...")
             local_path.unlink(missing_ok=True)
-            if not ensure_sso_valid(profile, buffer_seconds=10**9, emit=emit):
+            valid, _ = ensure_sso_valid(profile, buffer_seconds=10**9, emit=emit)
+            if not valid:
                 raise
             s3 = _make_s3_client(profile)
             s3.download_file(bucket, key, str(local_path))
