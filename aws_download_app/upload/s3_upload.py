@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from download.s3_browser import _make_s3_client
-from utils.config import MAX_UPLOAD_FILES, UPLOAD_CHUNK_SIZE
+from utils.config import MAX_UPLOAD_FILES_HARD, UPLOAD_CHUNK_SIZE
 from utils.session_guard import ensure_sso_valid, is_auth_error
 from utils.upload_checkpoint import (
     append_completed_keys,
@@ -29,7 +29,7 @@ class TooManyFilesError(ValueError):
 
 def collect_local_files(
     source: Path,
-    max_files: int = MAX_UPLOAD_FILES,
+    max_files: int = MAX_UPLOAD_FILES_HARD,
 ) -> list[tuple[Path, str]]:
     """
     Return a list of (local_path, relative_key) pairs for upload.
@@ -40,10 +40,12 @@ def collect_local_files(
 
     Raises:
         TooManyFilesError: if the folder contains more than *max_files* files.
-            Scanning stops as soon as the cap is exceeded rather than walking
-            the entire tree, so this stays cheap even for enormous folders —
-            it caps memory use up front instead of loading an unbounded file
-            list before the upload even starts.
+            This is a guard against truly runaway scans (e.g. accidentally
+            pointing the app at an entire drive), not a real dataset-size
+            limit — the chunked/checkpointed upload path is designed to
+            handle very large file counts. Scanning stops as soon as the cap
+            is exceeded rather than walking the entire tree, so this stays
+            cheap even for enormous folders.
     """
     source = Path(source)
     if source.is_file():
@@ -58,10 +60,9 @@ def collect_local_files(
             if len(items) > max_files:
                 raise TooManyFilesError(
                     f"Found more than {max_files} files under '{source}'. "
-                    "Please upload the folder in smaller batches (e.g. "
-                    "one sub-folder at a time), or raise MAX_UPLOAD_FILES "
-                    "in utils/config.py if you really need to upload this many "
-                    "at once."
+                    "That's far beyond a typical dataset and may mean the "
+                    "wrong folder was selected. If this is really intended, "
+                    "raise MAX_UPLOAD_FILES_HARD in utils/config.py."
                 )
     items.sort(key=lambda t: t[1])
     return items

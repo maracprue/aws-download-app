@@ -36,8 +36,38 @@ from upload.s3_upload import (
 )
 from upload.upload_runner import clear_job, get_current_job, start_upload_job
 from utils.aws_auth import check_credentials, run_sso_login
-from utils.config import AWS_PROFILE, S3_BUCKET, S3_PREFIX
+from utils.config import AWS_PROFILE, MAX_UPLOAD_FILES_WARN, S3_BUCKET, S3_PREFIX
 from utils.upload_checkpoint import checkpoint_id_for
+
+
+def _run_conflict_check(items, upload_bucket, upload_prefix, aws_profile) -> None:
+    """Run the S3 existing-keys check for *items* and stash the result for
+    the confirm/summary UI. Shared by the normal and large-scan-confirmed
+    paths so both end up in the same place."""
+    with st.spinner("Checking S3 for existing files..."):
+        prefix_clean = upload_prefix.strip("/")
+        target_keys = [
+            f"{prefix_clean}/{rel}" if prefix_clean else rel
+            for _, rel in items
+        ]
+        try:
+            existing = check_existing_keys(upload_bucket, target_keys, profile=aws_profile)
+        except Exception as e:
+            st.error(f"Could not check S3 for existing files: {e}")
+            existing = set()
+
+        total_bytes = sum(p.stat().st_size for p, _ in items)
+        size_label = (
+            f"{total_bytes / 1e9:.2f} GB" if total_bytes >= 1e9
+            else f"{total_bytes / 1e6:.1f} MB" if total_bytes >= 1e6
+            else f"{total_bytes / 1e3:.1f} KB"
+        )
+        st.session_state.upload_conflict_result = {
+            "items": items,
+            "existing": existing,
+            "total_bytes": total_bytes,
+            "size_label": size_label,
+        }
 
 # ──────────────────────────────────────────────
 # Page config
@@ -111,6 +141,13 @@ if "upload_source" not in st.session_state:
 if "upload_conflict_result" not in st.session_state:
     # Stores (items, existing_keys, overwrite_choice) after conflict check
     st.session_state.upload_conflict_result = None
+
+if "upload_large_scan_pending" not in st.session_state:
+    # Set to a (items, source_path) tuple when a scan finds more files than
+    # MAX_UPLOAD_FILES_WARN and is waiting on user confirmation before
+    # continuing to the (potentially slow) S3 conflict check.
+    st.session_state.upload_large_scan_pending = None
+
 
 # ──────────────────────────────────────────────
 # Main tabs
@@ -412,6 +449,7 @@ with tab_upload:
         if st.button("🔄 Clear / Start New Upload", key="clear_upload_job"):
             clear_job()
             st.session_state.upload_conflict_result = None
+            st.session_state.upload_large_scan_pending = None
             st.rerun()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -471,40 +509,48 @@ with tab_upload:
             if not source_path.exists():
                 st.error(f"Path does not exist: `{upload_source}`")
             else:
-                with st.spinner("Scanning local files and checking S3..."):
+                with st.spinner("Scanning local files..."):
                     try:
                         items = collect_local_files(source_path)
                     except TooManyFilesError as e:
                         st.error(f"🚫 {e}")
                         items = None
-                    if items is None:
-                        pass
-                    elif not items:
-                        st.warning("No files found at the specified path.")
-                    else:
-                        prefix_clean = upload_prefix.strip("/")
-                        target_keys = [
-                            f"{prefix_clean}/{rel}" if prefix_clean else rel
-                            for _, rel in items
-                        ]
-                        try:
-                            existing = check_existing_keys(upload_bucket, target_keys, profile=aws_profile)
-                        except Exception as e:
-                            st.error(f"Could not check S3 for existing files: {e}")
-                            existing = set()
+                if items is None:
+                    st.session_state.upload_large_scan_pending = None
+                elif not items:
+                    st.warning("No files found at the specified path.")
+                    st.session_state.upload_large_scan_pending = None
+                elif len(items) > MAX_UPLOAD_FILES_WARN:
+                    # Large but supported — ask for confirmation before doing
+                    # the (potentially slow) S3 listing/conflict check.
+                    st.session_state.upload_large_scan_pending = {
+                        "items": items,
+                        "source_path": str(source_path),
+                    }
+                else:
+                    st.session_state.upload_large_scan_pending = None
+                    _run_conflict_check(items, upload_bucket, upload_prefix, aws_profile)
 
-                        total_bytes = sum(p.stat().st_size for p, _ in items)
-                        size_label = (
-                            f"{total_bytes / 1e9:.2f} GB" if total_bytes >= 1e9
-                            else f"{total_bytes / 1e6:.1f} MB" if total_bytes >= 1e6
-                            else f"{total_bytes / 1e3:.1f} KB"
-                        )
-                        st.session_state.upload_conflict_result = {
-                            "items": items,
-                            "existing": existing,
-                            "total_bytes": total_bytes,
-                            "size_label": size_label,
-                        }
+        _pending = st.session_state.upload_large_scan_pending
+        if _pending:
+            n = len(_pending["items"])
+            st.warning(
+                f"⚠️ Found **{n:,} files** under `{_pending['source_path']}`. "
+                "This app can handle uploads this large — it uploads in "
+                "chunks and can resume if interrupted — but a scan/upload "
+                "this size can take a long time. Confirm to continue."
+            )
+            col_confirm, col_cancel = st.columns(2)
+            with col_confirm:
+                if st.button(f"✅ Proceed with {n:,} files", key="confirm_large_scan"):
+                    items = _pending["items"]
+                    st.session_state.upload_large_scan_pending = None
+                    _run_conflict_check(items, upload_bucket, upload_prefix, aws_profile)
+                    st.rerun()
+            with col_cancel:
+                if st.button("Cancel", key="cancel_large_scan"):
+                    st.session_state.upload_large_scan_pending = None
+                    st.rerun()
 
         if not can_check:
             st.caption("Enter a local path and target bucket above to enable conflict check.")
