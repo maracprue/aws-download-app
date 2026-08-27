@@ -1,43 +1,20 @@
 @echo off
-:: Updates the AWS S3 App from GitHub.
-:: Run this any time to pull the latest version and refresh dependencies.
-:: Works from any drive/folder — uses its own location as the repo root.
+:: Thin, stable launcher for the AWS S3 App updater.
+::
+:: The actual update logic lives in update_app.py, not here. Because this
+:: script updates itself as part of "git pull", keeping that logic in a
+:: batch file is fragile (cmd.exe re-reads .bat files from disk line by
+:: line as they execute, so the file changing mid-run can corrupt
+:: execution). Python fully reads and compiles a script before running it,
+:: so update_app.py is immune to that problem. This launcher itself should
+:: rarely if ever need to change.
 
 setlocal
 set "REPO_DIR=%~dp0"
 set "PYTHON=%USERPROFILE%\AppData\Local\miniconda3\python.exe"
+if not exist "%PYTHON%" set "PYTHON=python"
 
-cd /d "%REPO_DIR%"
-
-if not exist "%REPO_DIR%.git" (
-    echo This folder is not a git repository yet.
-    echo Clone it first with:
-    echo   git clone https://github.com/maracprue/aws-download-app.git
-    pause
-    exit /b 1
-)
-
-echo Checking for updates...
-git pull --ff-only
-if errorlevel 1 (
-    echo.
-    echo Update failed. You may have local changes that conflict with the update.
-    echo Resolve them manually, then re-run this script.
-    pause
-    exit /b 1
-)
-
-echo.
-echo Installing/updating Python dependencies...
-if not exist "%PYTHON%" (
-    echo Could not find Python at %PYTHON%
-    echo Edit update_app.bat and set PYTHON to your Python interpreter path.
-    pause
-    exit /b 1
-)
-
-"%PYTHON%" -m pip install -r "%REPO_DIR%aws_download_app\requirements.txt" --upgrade
-
-echo.
-echo Update complete! Launch the app with launch_aws_app.bat
+"%PYTHON%" -u "%REPO_DIR%update_app.py"
+set "RC=%errorlevel%"
 pause
+exit /b %RC%

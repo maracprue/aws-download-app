@@ -51,8 +51,12 @@ Built with [Streamlit](https://streamlit.io/) and [boto3](https://boto3.amazonaw
 ## Updating the app
 
 Whenever a new version is pushed to GitHub, just double-click **`update_app.bat`**. It will:
-- Pull the latest changes with `git pull`
+- Stash any local changes if present (so an accidental local edit never blocks the update)
+- Pull the latest changes with `git pull --ff-only`
+- Reapply your local changes on top of the update
 - Reinstall/upgrade Python dependencies from `requirements.txt`
+
+If something goes wrong partway through, your local changes are never lost — they're kept safe in `git stash list` and the script tells you how to recover them.
 
 ## Usage
 
