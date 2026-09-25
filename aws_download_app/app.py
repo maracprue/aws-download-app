@@ -21,7 +21,7 @@ load_dotenv(Path(__file__).parent / ".env")
 # Make sure sibling modules are importable
 sys.path.insert(0, str(Path(__file__).parent))
 
-from download.s3_browser import folder_name, list_prefix, prefix_to_breadcrumbs
+from download.s3_browser import folder_name, list_prefix, prefix_to_breadcrumbs, search_prefixes
 from download.s3_download import download_prefix, list_all_objects
 from download.download_runner import (
     clear_download_job,
@@ -127,6 +127,15 @@ if "s3_bucket" not in st.session_state:
 
 if "local_dest" not in st.session_state:
     st.session_state.local_dest = ""
+
+if "search_query" not in st.session_state:
+    st.session_state.search_query = ""
+
+if "search_results" not in st.session_state:
+    # Set to a (folders, objects, query, base_prefix) tuple after a search
+    # is run, so results survive reruns until cleared or a new search runs.
+    st.session_state.search_results = None
+
 
 # Upload-specific state
 if "upload_bucket" not in st.session_state:
@@ -240,15 +249,102 @@ with tab_download:
                     st.rerun()
 
         st.caption(f"**Bucket:** `{bucket}`  |  **Current path:** `/{current_prefix}`")
+
+        # ── Search within the current folder ────────────────────────────
+        # Uses S3's native Prefix filtering (search_prefixes), not a client
+        # -side scan of everything at this level — this stays fast even in
+        # buckets/folders with far too many entries to browse by listing
+        # alone (e.g. hundreds of thousands of top-level folders).
+        search_col, btn_col, clear_col = st.columns([6, 1, 1])
+        with search_col:
+            search_query = st.text_input(
+                "🔎 Search folders/files starting with…",
+                value=st.session_state.search_query,
+                placeholder="e.g. output-XETG00214__0096808",
+                key="search_query_input",
+                label_visibility="collapsed",
+            )
+        with btn_col:
+            do_search = st.button("Search", key="do_search_btn")
+        with clear_col:
+            do_clear_search = st.button("Clear", key="clear_search_btn")
+
+        if do_clear_search:
+            st.session_state.search_query = ""
+            st.session_state.search_results = None
+            st.rerun()
+
+        if do_search:
+            st.session_state.search_query = search_query
+            if not search_query.strip():
+                st.session_state.search_results = None
+            else:
+                with st.spinner(f"Searching for '{search_query}'…"):
+                    try:
+                        s_folders, s_objects = search_prefixes(
+                            bucket, current_prefix, search_query, profile=aws_profile
+                        )
+                    except Exception as e:
+                        st.error(f"Search failed: {e}")
+                        s_folders, s_objects = [], []
+                st.session_state.search_results = {
+                    "folders": s_folders,
+                    "objects": s_objects,
+                    "query": search_query,
+                    "base_prefix": current_prefix,
+                }
+
+        _search = st.session_state.search_results
+        # Stale results (from a different folder than we're currently in)
+        # are dropped rather than shown, since they'd be confusing.
+        if _search and _search["base_prefix"] != current_prefix:
+            st.session_state.search_results = None
+            _search = None
+
+        if _search:
+            n_found = len(_search["folders"]) + len(_search["objects"])
+            if n_found == 0:
+                st.warning(f"No folders or files starting with '{_search['query']}' found here.")
+            else:
+                st.success(f"Found {n_found} match(es) for '{_search['query']}':")
+                for folder_prefix in _search["folders"]:
+                    name = folder_name(folder_prefix)
+                    if st.button(f"📁  {name}", key=f"search_folder_{folder_prefix}"):
+                        st.session_state.current_prefix = folder_prefix
+                        st.session_state.search_query = ""
+                        st.session_state.search_results = None
+                        st.rerun()
+                for obj in _search["objects"]:
+                    st.text(f"  📄 {obj.name}  ({obj.size_human})")
+
         st.divider()
 
-        # List current prefix
+        # List current prefix. Capped by default so a folder with an
+        # enormous number of immediate entries (e.g. a bucket root used to
+        # dump hundreds of thousands of dataset folders) can't hang the UI —
+        # use the search box above to jump straight to a known folder
+        # instead, or click through to load the full listing anyway.
+        load_full_key = f"load_full_listing_{current_prefix}"
+        want_full = st.session_state.get(load_full_key, False)
+        list_cap = None if want_full else 2000
         try:
             with st.spinner("Loading..."):
-                folders, objects = list_prefix(bucket, current_prefix, profile=aws_profile)
+                folders, objects, truncated = list_prefix(
+                    bucket, current_prefix, profile=aws_profile, max_items=list_cap
+                )
         except Exception as e:
             st.error(f"Could not list S3 contents: {e}")
             st.stop()
+
+        if truncated:
+            st.warning(
+                f"This folder has more than {list_cap} entries — showing the first "
+                f"{len(folders) + len(objects)} for speed. Use search above to jump "
+                "to a specific folder, or load the full listing below (may be slow)."
+            )
+            if st.button("⏳ Load full listing anyway", key=f"load_full_btn_{current_prefix}"):
+                st.session_state[load_full_key] = True
+                st.rerun()
 
         # Go up button
         if current_prefix:
