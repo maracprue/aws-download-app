@@ -311,11 +311,13 @@ with tab_download:
                     name = folder_name(folder_prefix)
                     cb_col, nav_col = st.columns([1, 11])
                     with cb_col:
-                        # Same cb_{prefix} key convention as the regular folder
-                        # listing below, so a checked search result is picked up
-                        # by selected_folders and can be downloaded directly.
+                        # Uses a distinct widget key from the regular folder
+                        # listing's cb_{prefix} (a search hit may also appear
+                        # there if it's at the current level) — Streamlit
+                        # requires unique keys per element. Both are OR'd
+                        # together below when computing selected_folders.
                         st.checkbox(
-                            "Select", key=f"cb_{folder_prefix}", label_visibility="collapsed"
+                            "Select", key=f"cb_search_{folder_prefix}", label_visibility="collapsed"
                         )
                     with nav_col:
                         if st.button(f"📁  {name}", key=f"search_folder_{folder_prefix}"):
@@ -400,7 +402,7 @@ with tab_download:
         if _search:
             selected_folders += [
                 fp for fp in _search["folders"]
-                if fp not in selected_folders and st.session_state.get(f"cb_{fp}", False)
+                if fp not in selected_folders and st.session_state.get(f"cb_search_{fp}", False)
             ]
 
         # Show files at this level
