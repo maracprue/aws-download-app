@@ -309,11 +309,20 @@ with tab_download:
                 st.success(f"Found {n_found} match(es) for '{_search['query']}':")
                 for folder_prefix in _search["folders"]:
                     name = folder_name(folder_prefix)
-                    if st.button(f"📁  {name}", key=f"search_folder_{folder_prefix}"):
-                        st.session_state.current_prefix = folder_prefix
-                        st.session_state.search_query = ""
-                        st.session_state.search_results = None
-                        st.rerun()
+                    cb_col, nav_col = st.columns([1, 11])
+                    with cb_col:
+                        # Same cb_{prefix} key convention as the regular folder
+                        # listing below, so a checked search result is picked up
+                        # by selected_folders and can be downloaded directly.
+                        st.checkbox(
+                            "Select", key=f"cb_{folder_prefix}", label_visibility="collapsed"
+                        )
+                    with nav_col:
+                        if st.button(f"📁  {name}", key=f"search_folder_{folder_prefix}"):
+                            st.session_state.current_prefix = folder_prefix
+                            st.session_state.search_query = ""
+                            st.session_state.search_results = None
+                            st.rerun()
                 for obj in _search["objects"]:
                     st.text(f"  📄 {obj.name}  ({obj.size_human})")
 
@@ -386,6 +395,13 @@ with tab_download:
             st.caption("_(No sub-folders)_")
 
         selected_folders = [fp for fp in folders if st.session_state.get(f"cb_{fp}", False)]
+        # Also include any checked folders from search results, since search
+        # can surface folders at levels other than the currently-listed one.
+        if _search:
+            selected_folders += [
+                fp for fp in _search["folders"]
+                if fp not in selected_folders and st.session_state.get(f"cb_{fp}", False)
+            ]
 
         # Show files at this level
         if objects:
